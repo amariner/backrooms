@@ -1,4 +1,6 @@
-/** Quiet, entirely procedural soundscape. Audio is created only by start(). */
+import { EntityCallVoice } from './entity-call-voice.js';
+
+/** Quiet procedural soundscape and one bundled comic voice. Created by start(). */
 export class AtmosphereAudio {
   constructor() {
     this.context = null;
@@ -13,6 +15,7 @@ export class AtmosphereAudio {
     this.loops = [];
     this.stepCountdown = 0.12;
     this.modulationCountdown = 0;
+    this.entityCallVoice = new EntityCallVoice();
   }
 
   async start() {
@@ -71,6 +74,7 @@ export class AtmosphereAudio {
         }
       }
       if (this.context.state === 'suspended') await this.context.resume();
+      void this.entityCallVoice.load(this.context);
     } catch {
       // A blocked or unavailable sound device must never prevent playing.
     }
@@ -78,11 +82,13 @@ export class AtmosphereAudio {
 
   setMuted(muted) {
     this.muted = Boolean(muted);
+    if (this.muted) this.stopCall();
     this.setParam(this.master?.gain, this.muted ? 0 : 0.48, 0.035);
   }
 
   setActive(active) {
     this.active = Boolean(active);
+    if (!this.active) this.stopCall();
     this.stepCountdown = 0.12;
     this.setParam(this.ambience?.gain, this.active ? 0.24 : 0.07, 0.4);
   }
@@ -94,6 +100,15 @@ export class AtmosphereAudio {
     } catch {
       // Browsers can close audio between frames during navigation or sleep.
     }
+  }
+
+  async callEntity() {
+    if (!this.active || this.muted || this.disposed || !this.context || this.context.state === 'closed') return false;
+    return this.entityCallVoice.play(this.context, this.master);
+  }
+
+  stopCall() {
+    this.entityCallVoice.stop();
   }
 
   update({ moving = false, sprinting = false, dt = 0, tension = 0 } = {}) {
@@ -177,14 +192,26 @@ export class AtmosphereAudio {
     }
   }
 
-  pickup() {
-    this.tone(440, 0.35, 0.075, 0, 'sine');
-    this.tone(660, 0.5, 0.055, 0.11, 'sine');
-  }
-
-  denied() {
-    this.tone(145, 0.2, 0.085, 0, 'triangle', 105);
-    this.tone(125, 0.16, 0.055, 0.17, 'sine', 95);
+  presence(distance, pan = 0, breath = false, occluded = false) {
+    if (!this.active || this.muted || !this.noise || this.context?.state !== 'running' || distance > 24) return;
+    try {
+      const context = this.context, now = context.currentTime;
+      const source = context.createBufferSource(), filter = context.createBiquadFilter();
+      const gain = context.createGain(), spatial = context.createStereoPanner();
+      const duration = breath ? 1.25 : .28;
+      const volume = (breath ? .075 : .19) * (1 - Math.min(distance / 24, 1)) ** 1.4 * (occluded ? .28 : 1);
+      source.buffer = this.noise; source.playbackRate.value = breath ? .58 : .72;
+      filter.type = breath ? 'bandpass' : 'lowpass';
+      filter.frequency.value = breath ? (occluded ? 340 : 690) : 230;
+      filter.Q.value = breath ? 1.5 : .7;
+      spatial.pan.value = Math.max(-.9, Math.min(.9, pan));
+      gain.gain.setValueAtTime(.0001, now);
+      gain.gain.exponentialRampToValueAtTime(Math.max(.0002, volume), now + (breath ? .4 : .035));
+      gain.gain.exponentialRampToValueAtTime(.0001, now + duration);
+      source.connect(filter); filter.connect(gain); gain.connect(spatial); spatial.connect(this.master);
+      source.onended = () => { source.disconnect(); filter.disconnect(); gain.disconnect(); spatial.disconnect(); };
+      source.start(now, breath ? 0 : .4); source.stop(now + duration + .02);
+    } catch { /* Optional spatial audio must never interrupt the game. */ }
   }
 
   escape() {
@@ -196,6 +223,8 @@ export class AtmosphereAudio {
 
   dispose() {
     this.disposed = true;
+    this.stopCall();
+    this.entityCallVoice.buffer = null;
     for (const source of this.loops) {
       try { source.stop(); source.disconnect(); } catch { /* Already stopped. */ }
     }

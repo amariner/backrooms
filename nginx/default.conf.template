@@ -1,0 +1,44 @@
+# Only Vite's content-hashed assets are immutable. HTML and unversioned audio
+# must be able to refresh after a deployment.
+map $uri $backrooms_cache_control {
+    default "no-cache";
+    ~^/assets/ "public, max-age=31536000, immutable";
+    ~^/audio/ "public, max-age=3600";
+}
+
+server {
+    listen 0.0.0.0:${PORT};
+    server_name _;
+    root /usr/share/nginx/backrooms;
+    index index.html;
+    server_tokens off;
+
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
+
+    add_header Cache-Control $backrooms_cache_control;
+    add_header X-Content-Type-Options nosniff always;
+    add_header Referrer-Policy strict-origin-when-cross-origin always;
+
+    gzip on;
+    gzip_vary on;
+    gzip_min_length 1024;
+    gzip_types text/css application/javascript application/json image/svg+xml;
+
+    location /assets/ {
+        try_files $uri =404;
+    }
+
+    # mime.types supplies audio/mpeg for MP3; preserve range requests and 404s.
+    location /audio/ {
+        try_files $uri =404;
+    }
+
+    location ~ /\. {
+        return 404;
+    }
+
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+}

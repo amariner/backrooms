@@ -1,29 +1,43 @@
 import * as THREE from 'three';
-import { WORLD, CELL_SIZE, WALL_HEIGHT, isWalkable, findPath, validateWorld } from './world-layout.js';
+import { WORLD as LEVEL_ZERO, CELL_SIZE, WALL_HEIGHT, isWalkable as walkableIn, findPath as pathIn, validateWorld } from './world-layout.js';
 import { wallpaper, carpet, ceiling, labelTexture } from './textures.js';
 import { AtmosphereAudio } from './audio.js';
+import { LEVEL_ONE, validateLevelOne } from './level-one-layout.js';
+import { LevelOneState } from './level-one-state.js';
+import { buildLevelOneScene } from './level-one-scene.js';
+import { EntityCallState } from './entity-call-state.js';
+import { TouchControls, supportsTouchControls } from './touch-controls.js';
+
+const advanced = new URLSearchParams(location.search).get('level') === '1';
+const WORLD = advanced ? LEVEL_ONE : LEVEL_ZERO;
+const isWalkable = (x, z, radius = .23) => walkableIn(x, z, radius, WORLD);
+const findPath = (x, z, tx, tz) => pathIn(x, z, tx, tz, WORLD);
+const levelState = advanced ? new LevelOneState() : null;
+const entityCall = new EntityCallState();
+let levelScene, entityPosition = advanced ? { ...WORLD.entitySpawn } : null;
+let entityPath = [], entityRouteTick = 0, patrolIndex = 0, hiddenInShelter = false;
+let lastBlackout = false, lastPresence = false, breathingClock = 0, entityStepDistance = 0;
+let lastKnownPosition = null;
 
 const $ = (id) => document.getElementById(id);
 const canvas = $('scene-canvas');
 const audio = new AtmosphereAudio();
 const keys = new Set();
-const collected = new Set();
-const fuseObjects = [];
 const lightPool = [];
-const routeDots = [];
 const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
-let renderer, scene, camera, flashlight, exitGroup, exitIndicator, exitStatusSign, exitHeaderSign;
+let touchMode = supportsTouchControls(), touchControls, touchSprint = false;
+let renderer, scene, camera, flashlight;
 let mode = 'menu', elapsed = 0, stamina = 1, exhausted = false;
 let yaw = WORLD.spawn.yaw, pitch = 0, bob = 0, sensitivity = 1;
 let muted = false, flashlightOn = false, pointerWasLocked = false, dragging = false;
-let currentTarget = null, toastTimeout, hintUntil = 0, lastHud = -1, lightTick = 0;
-let hintRoute = [], hintTarget = null, hintRefresh = 0;
+let currentTarget = null, toastTimeout, lastHud = -1, lightTick = 0;
 const player = { x: WORLD.spawn.x, z: WORLD.spawn.z };
 const wallMaterial = new THREE.MeshStandardMaterial({ map: wallpaper(), roughness: .95, color: '#e2d796' });
 
 function box(w, h, d, material, x, y, z, parent = scene) {
   const mesh = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), material);
-  mesh.position.set(x, y, z); parent.add(mesh); return mesh;
+  mesh.position.set(x, y, z); mesh.castShadow = true; mesh.receiveShadow = true;
+  parent.add(mesh); return mesh;
 }
 
 function sign(text, subtitle, width, x, y, z, yaw = 0, color, bg, parent = scene) {
@@ -35,17 +49,22 @@ function sign(text, subtitle, width, x, y, z, yaw = 0, color, bg, parent = scene
 
 function buildWorld() {
   scene = new THREE.Scene();
-  scene.background = new THREE.Color('#393725');
-  scene.fog = new THREE.FogExp2('#4c472b', .023);
+  scene.background = new THREE.Color('#070906');
+  scene.fog = new THREE.FogExp2('#0d110b', .048);
   camera = new THREE.PerspectiveCamera(74, innerWidth / innerHeight, .07, 95);
   camera.rotation.order = 'YXZ';
   camera.position.set(player.x, 1.62, player.z);
   scene.add(camera);
-  scene.add(new THREE.AmbientLight('#f3df9f', .65));
-  scene.add(new THREE.HemisphereLight('#f1edcd', '#4a4222', .8));
+  if (advanced) {
+    levelScene = buildLevelOneScene(scene, WORLD, { touch: touchMode });
+    buildPlayerLights();
+    return;
+  }
+  scene.add(new THREE.AmbientLight('#d6c996', .075));
+  scene.add(new THREE.HemisphereLight('#9faaa0', '#13160e', .15));
   const dim = WORLD.grid.length * CELL_SIZE;
   const floor = new THREE.Mesh(new THREE.PlaneGeometry(dim, dim), new THREE.MeshStandardMaterial({ map: carpet(WORLD.grid.length * 2), roughness: 1 }));
-  floor.rotation.x = -Math.PI / 2; floor.position.set(dim / 2, 0, dim / 2); scene.add(floor);
+  floor.rotation.x = -Math.PI / 2; floor.position.set(dim / 2, 0, dim / 2); floor.receiveShadow = true; scene.add(floor);
   const roof = new THREE.Mesh(new THREE.PlaneGeometry(dim, dim), new THREE.MeshStandardMaterial({ map: ceiling(WORLD.grid.length * 2), roughness: 1 }));
   roof.rotation.x = Math.PI / 2; roof.position.set(dim / 2, WALL_HEIGHT, dim / 2); scene.add(roof);
 
@@ -63,6 +82,7 @@ function buildWorld() {
     trim.setMatrixAt(i, matrix.makeTranslation(wx, .065, wz));
     topTrim.setMatrixAt(i, matrix.makeTranslation(wx, WALL_HEIGHT - .028, wz));
   });
+  walls.castShadow = true; walls.receiveShadow = true;
   scene.add(walls, trim, topTrim);
 
   // Each contact shadow is baked into a transparent floor strip, not a real-time shadow map.
@@ -86,19 +106,20 @@ function buildWorld() {
   scene.add(shadowMesh);
 
   const fixtureMat = new THREE.MeshStandardMaterial({ color: '#5f604a', roughness: .72 });
-  const glowMat = new THREE.MeshBasicMaterial({ color: '#fff5c1' });
+  const glowMat = new THREE.MeshBasicMaterial({ color: '#807954' });
+  const deadTubeMat = new THREE.MeshStandardMaterial({ color: '#242b22', roughness: .8 });
   WORLD.lights.forEach(({ x, z }, i) => {
     box(1.95, .065, .5, fixtureMat, x, WALL_HEIGHT - .04, z);
-    box(1.77, .018, .115, glowMat, x, WALL_HEIGHT - .08, z - .105);
-    box(1.77, .018, .115, glowMat, x, WALL_HEIGHT - .08, z + .105);
+    box(1.77, .018, .115, i % 3 === 0 ? glowMat : deadTubeMat, x, WALL_HEIGHT - .08, z - .105);
+    box(1.77, .018, .115, i % 3 === 0 ? glowMat : deadTubeMat, x, WALL_HEIGHT - .08, z + .105);
     if (i % 4 === 0) {
       const tile = new THREE.Mesh(new THREE.PlaneGeometry(.6, .34), new THREE.MeshStandardMaterial({ color: '#74735b', roughness: 1 }));
       tile.rotation.x = Math.PI / 2; tile.position.set(x + .95, WALL_HEIGHT - .012, z + 1.25); scene.add(tile);
       for (let n = 0; n < 7; n++) box(.48, .012, .012, fixtureMat, x + .95, WALL_HEIGHT - .024, z + 1.13 + n * .04);
     }
   });
-  for (let i = 0; i < 8; i++) {
-    const light = new THREE.PointLight(i % 3 === 0 ? '#fff3bd' : '#f6edc1', 17, 14, 2);
+  for (let i = 0; i < 5; i++) {
+    const light = new THREE.PointLight(i % 3 === 0 ? '#ded0a1' : '#bac2a1', 4.2, 10, 2);
     scene.add(light); lightPool.push(light);
   }
   const frameMat = new THREE.MeshStandardMaterial({ color: '#4a4b39', roughness: .8 });
@@ -110,43 +131,26 @@ function buildWorld() {
     sign(s.text, s.subtitle, 2.25, 0, 2.57, -.041, Math.PI, '#e4e1bd', '#343a2b', group);
     for (const x of [-.85, .85]) box(.022, .27, .022, frameMat, x, 2.99, 0, group);
   });
-  WORLD.fuses.forEach((fuse) => buildFuse(fuse));
   buildExit();
+  buildPlayerLights();
+}
 
-  flashlight = new THREE.SpotLight('#fff4d8', 0, 25, Math.PI / 6.4, .6, 1.3);
+function buildPlayerLights() {
+  flashlight = new THREE.SpotLight('#ded9c8', 0, 21, Math.PI / 7, .65, 1.3);
+  flashlight.castShadow = true;
+  const shadowSize = touchMode ? 512 : 1024;
+  flashlight.shadow.mapSize.set(shadowSize, shadowSize);
+  flashlight.shadow.camera.near = .12;
+  flashlight.shadow.camera.far = 21;
+  flashlight.shadow.bias = -.0003;
+  flashlight.shadow.normalBias = .028;
   flashlight.position.set(.22, -.15, -.12);
   flashlight.target.position.set(0, -.06, -8);
   camera.add(flashlight, flashlight.target);
-  const dotGeometry = new THREE.RingGeometry(.045, .085, 16);
-  const dotMaterial = new THREE.MeshBasicMaterial({ color: '#e8efab', transparent: true, opacity: .65, depthWrite: false });
-  for (let i = 0; i < 9; i++) {
-    const dot = new THREE.Mesh(dotGeometry, dotMaterial); dot.rotation.x = -Math.PI / 2; dot.visible = false; scene.add(dot); routeDots.push(dot);
-  }
-}
-
-function buildFuse(fuse) {
-  const group = new THREE.Group(); group.position.set(fuse.x, 0, fuse.z); scene.add(group);
-  const steel = new THREE.MeshStandardMaterial({ color: '#4d5147', roughness: .68, metalness: .35 });
-  box(.72, 1.3, .55, steel, 0, .65, 0, group);
-  const face = new THREE.MeshStandardMaterial({ color: '#798070', roughness: .8 });
-  box(.64, .95, .03, face, 0, .78, .29, group);
-  sign(`FUSIBLE ${fuse.id}`, fuse.label, .64, 0, 1.08, .31, 0, '#edebc5', '#30372c', group);
-  const item = new THREE.Group(); group.add(item);
-  const bodyMat = new THREE.MeshStandardMaterial({ color: '#eff3b3', emissive: '#d3ec66', emissiveIntensity: .75, roughness: .32, metalness: .2 });
-  const fuseBody = new THREE.Mesh(new THREE.CylinderGeometry(.105, .105, .35, 12), bodyMat);
-  fuseBody.position.y = 1.65; item.add(fuseBody);
-  const metal = new THREE.MeshStandardMaterial({ color: '#c8c9a4', metalness: .8, roughness: .3 });
-  for (const y of [1.44, 1.86]) {
-    const end = new THREE.Mesh(new THREE.CylinderGeometry(.12, .12, .08, 12), metal); end.position.y = y; item.add(end);
-  }
-  const beacon = new THREE.PointLight('#deed97', 3.5, 5, 2); beacon.position.set(0, 1.85, 0); group.add(beacon);
-  // Three fixed object lights are inexpensive and help locate pickups around corners.
-  const indicator = sign(fuse.id, '', .35, 0, 2.17, 0, 0, '#eff5bd', '#4b542a', group);
-  fuseObjects.push({ ...fuse, group, item, beacon, indicator, kind: 'fuse' });
 }
 
 function buildExit() {
-  exitGroup = new THREE.Group(); exitGroup.position.set(WORLD.exit.x, 0, WORLD.exit.z); exitGroup.rotation.y = WORLD.exit.yaw; scene.add(exitGroup);
+  const exitGroup = new THREE.Group(); exitGroup.position.set(WORLD.exit.x, 0, WORLD.exit.z); exitGroup.rotation.y = WORLD.exit.yaw; scene.add(exitGroup);
   const steel = new THREE.MeshStandardMaterial({ color: '#434e42', metalness: .3, roughness: .65 });
   const door = new THREE.MeshStandardMaterial({ color: '#65755c', roughness: .75, metalness: .2 });
   for (const x of [-.93, .93]) box(.15, 2.92, .3, steel, x, 1.46, 0, exitGroup);
@@ -154,22 +158,11 @@ function buildExit() {
   box(1.72, 2.75, .15, door, 0, 1.375, 0, exitGroup);
   box(1.24, .08, .09, steel, 0, 1.16, .15, exitGroup);
   box(1.3, .56, .018, steel, 0, 2.03, .089, exitGroup);
-  exitHeaderSign = sign('SALIDA', 'RESTABLECER SUMINISTRO', 1.65, 0, 2.6, .17, 0, '#c3d9a2', '#273829', exitGroup);
-  exitStatusSign = sign('ACCESO BLOQUEADO', 'SE NECESITAN 3 FUSIBLES', 1.25, 0, 2.03, .105, 0, '#e7c28c', '#343c2e', exitGroup);
-  exitIndicator = new THREE.MeshBasicMaterial({ color: '#dc754e' });
+  sign('SALIDA', 'AL OTRO LADO', 1.65, 0, 2.6, .17, 0, '#9aa783', '#152019', exitGroup);
+  sign('ABRIR LA PUERTA', touchMode ? 'TOCA ABRIR' : 'E', 1.25, 0, 2.03, .105, 0, '#aeb294', '#252b22', exitGroup);
+  const exitIndicator = new THREE.MeshBasicMaterial({ color: '#83956a' });
   box(.12, .12, .06, exitIndicator, .65, 1.4, .12, exitGroup);
-  const light = new THREE.PointLight('#bdd6a0', 6, 9, 2); light.position.set(0, 2.7, 1); exitGroup.add(light);
-}
-
-function setExitPowered(powered) {
-  exitIndicator.color.set(powered ? '#caf08d' : '#dc754e');
-  for (const [mesh, title, subtitle] of [
-    [exitHeaderSign, 'SALIDA', powered ? 'SUMINISTRO RESTABLECIDO' : 'RESTABLECER SUMINISTRO'],
-    [exitStatusSign, powered ? 'ACCESO HABILITADO' : 'ACCESO BLOQUEADO', powered ? 'PULSA E PARA SALIR' : 'SE NECESITAN 3 FUSIBLES'],
-  ]) {
-    mesh.material.map.dispose();
-    mesh.material.map = labelTexture(title, subtitle, powered ? '#dbf3b3' : '#e7c28c', '#343c2e');
-  }
+  const light = new THREE.PointLight('#a8b898', 2.4, 6, 2); light.position.set(0, 2.7, 1); exitGroup.add(light);
 }
 
 function toast(message, duration = 4200) {
@@ -184,25 +177,43 @@ function syncAudioButton() {
 }
 
 function hideScreens() {
-  ['menu', 'pause-screen', 'win-screen', 'hud'].forEach((id) => { $(id).hidden = true; });
+  ['menu', 'pause-screen', 'win-screen', 'dead-screen', 'hud'].forEach((id) => { $(id).hidden = true; });
+}
+
+function setMode(next) {
+  mode = next;
+  document.body.dataset.mode = next;
+}
+
+function resetInput() {
+  keys.clear(); dragging = false; touchSprint = false;
+  touchControls?.reset();
+  $('touch-sprint')?.setAttribute('aria-pressed', 'false');
 }
 
 function resetGame() {
-  collected.clear(); elapsed = 0; stamina = 1; exhausted = false; pitch = 0; bob = 0;
+  resetInput();
+  entityCall.reset(); audio.stopCall();
+  elapsed = 0; stamina = 1; exhausted = false; pitch = 0; bob = 0;
   yaw = WORLD.spawn.yaw; player.x = WORLD.spawn.x; player.z = WORLD.spawn.z;
-  flashlightOn = false; flashlight.intensity = 0; hintUntil = 0; currentTarget = null;
-  fuseObjects.forEach((f) => { f.item.visible = true; f.beacon.intensity = 3.5; f.indicator.visible = true; });
-  setExitPowered(false);
-  $('objective-title').textContent = 'RESTABLECE LA ENERGÍA';
-  $('objective-detail').textContent = 'Encuentra los tres fusibles del edificio.';
-  $('fuse-count').textContent = '0 / 3';
-  $('flashlight-status').textContent = 'LINTERNA OFF';
-  $('interaction-prompt').hidden = true; $('hint-text').hidden = true;
-  routeDots.forEach((dot) => { dot.visible = false; });
+  flashlightOn = true; flashlight.intensity = 18; currentTarget = null;
+  $('objective-title').textContent = 'ENCUENTRA LA SALIDA';
+  $('objective-detail').textContent = advanced ? 'Busca una puerta. Escucha antes de cruzar.' : 'Hay una puerta al final de estos pasillos.';
+  $('flashlight-status').textContent = 'LINTERNA ON';
+  $('interaction-prompt').hidden = true;
+  $('shelter-status').hidden = true; $('blackout-status').hidden = true;
+  if (advanced) {
+    levelState.reset(); entityPosition = { ...WORLD.entitySpawn };
+    entityPath = []; entityRouteTick = 0; patrolIndex = 0;
+    hiddenInShelter = false; lastBlackout = false; lastPresence = false; breathingClock = 0;
+    entityStepDistance = 0; lastKnownPosition = null;
+  }
+  document.body.classList.remove('presence-near', 'power-out');
   keys.clear(); updateHud();
 }
 
 function acquireMouse() {
+  if (touchMode) return;
   try {
     const request = canvas.requestPointerLock?.();
     request?.catch(() => mouseFallback());
@@ -211,27 +222,33 @@ function acquireMouse() {
 }
 
 function mouseFallback() {
-  if (mode === 'playing') toast('Mantén pulsado el ratón y arrastra para mirar. WASD para moverte.', 6500);
+  if (mode === 'playing' && !touchMode) toast('Mantén pulsado el ratón y arrastra para mirar. WASD para moverte.', 6500);
 }
 
 function startGame(restart = true) {
   if (restart) resetGame();
-  hideScreens(); $('hud').hidden = false; mode = 'playing';
-  keys.clear(); dragging = false; canvas.focus();
+  hideScreens(); $('hud').hidden = false; setMode('playing');
+  resetInput(); canvas.focus({ preventScroll: true });
   audio.start(); audio.setActive(true); acquireMouse();
-  if (restart) toast('Busca tres fusibles. Sigue las señales; pulsa H si necesitas orientación.', 6000);
+  updateHud();
+  if (restart) toast(touchMode
+    ? 'Joystick para moverte. Arrastra la zona derecha para mirar. Toca los botones para actuar.'
+    : advanced
+    ? 'Encuentra la salida. Si escuchas pasos, apaga la linterna y rompe la línea de visión.'
+    : 'Busca la puerta de salida. F controla la linterna. E abre la puerta.', 5500);
 }
 
 function pauseGame() {
   if (mode !== 'playing') return;
-  mode = 'paused'; keys.clear(); dragging = false; hideScreens(); $('pause-screen').hidden = false;
+  setMode('paused'); resetInput(); hideScreens(); $('pause-screen').hidden = false;
+  $('toast').hidden = true;
   $('interaction-prompt').hidden = true; audio.setActive(false);
   if (document.pointerLockElement) document.exitPointerLock();
   $('resume-button').focus();
 }
 
 function goHome() {
-  mode = 'menu'; keys.clear(); audio.setActive(false);
+  setMode('menu'); resetInput(); audio.setActive(false);
   if (document.pointerLockElement) document.exitPointerLock();
   hideScreens(); $('menu').hidden = false; $('toast').hidden = true; resetGame();
   $('start-button').focus();
@@ -239,25 +256,24 @@ function goHome() {
 
 function canMove(x, z) {
   if (!isWalkable(x, z, .24)) return false;
-  for (const f of fuseObjects) {
-    if (Math.abs(x - f.x) < .6 && Math.abs(z - f.z) < .52) return false;
-  }
+  if (advanced && levelScene.blockers.some((b) => Math.abs(x - b.x) < b.halfX + .24 && Math.abs(z - b.z) < b.halfZ + .24)) return false;
   const doorX = x - WORLD.exit.x, doorZ = z - WORLD.exit.z;
   const c = Math.cos(WORLD.exit.yaw), s = Math.sin(WORLD.exit.yaw);
   return !(Math.abs(doorX * c - doorZ * s) < 1.18 && Math.abs(doorX * s + doorZ * c) < .4);
 }
 
-function lineOfSight(target) {
-  const distance = Math.hypot(target.x - player.x, target.z - player.z);
+function lineOfSight(target, from = player) {
+  const distance = Math.hypot(target.x - from.x, target.z - from.z);
   for (let i = .2; i < distance; i += .2) {
-    if (!isWalkable(player.x + (target.x - player.x) * i / distance, player.z + (target.z - player.z) * i / distance, 0)) return false;
+    if (!isWalkable(from.x + (target.x - from.x) * i / distance, from.z + (target.z - from.z) * i / distance, 0)) return false;
   }
   return true;
 }
 
 function getTarget() {
   let closest = null, best = 2.7;
-  for (const target of [...fuseObjects.filter((f) => !collected.has(f.id)), { ...WORLD.exit, kind: 'exit' }]) {
+  const targets = advanced ? levelScene.interactables : [{ ...WORLD.exit, kind: 'exit' }];
+  for (const target of targets) {
     const dx = target.x - player.x, dz = target.z - player.z;
     const dist = Math.hypot(dx, dz);
     const facing = (-Math.sin(yaw) * dx - Math.cos(yaw) * dz) / (dist || 1);
@@ -267,26 +283,99 @@ function getTarget() {
 }
 
 function interact() {
-  const target = getTarget();
-  if (!target) return;
-  if (target.kind === 'fuse') {
-    collected.add(target.id); target.item.visible = false; target.beacon.intensity = .3; target.indicator.visible = false;
-    $('fuse-count').textContent = `${collected.size} / 3`; audio.pickup();
-    if (collected.size === 3) {
-      $('objective-title').textContent = 'ENCUENTRA LA SALIDA';
-      $('objective-detail').textContent = 'La puerta tiene energía. Regresa al extremo norte.';
-      setExitPowered(true);
-      toast('Energía restablecida. La salida te espera al norte.', 6000);
-    } else toast(`Fusible ${target.id} recuperado. ${3 - collected.size} por encontrar.`);
-    hintRefresh = 0;
-  } else if (collected.size < 3) {
-    audio.denied(); toast(`Sin energía. Faltan ${3 - collected.size} fusibles para abrir la salida.`);
-  } else {
-    mode = 'won'; keys.clear(); hideScreens(); $('win-screen').hidden = false;
-    $('win-time').textContent = formatTime(elapsed); $('toast').hidden = true;
-    if (document.pointerLockElement) document.exitPointerLock();
-    audio.escape(); audio.setActive(false); $('win-restart-button').focus();
+  if (mode !== 'playing' || !getTarget()) return;
+  setMode('won'); resetInput(); hideScreens(); $('win-screen').hidden = false;
+  $('win-time').textContent = formatTime(elapsed);
+  $('win-summary').textContent = 'SALIDA ENCONTRADA';
+  $('toast').hidden = true;
+  document.body.classList.remove('presence-near');
+  if (document.pointerLockElement) document.exitPointerLock();
+  audio.escape(); audio.setActive(false); $('win-restart-button').focus();
+}
+
+function failLevelOne() {
+  if (mode !== 'playing') return;
+  setMode('dead'); resetInput(); hideScreens(); $('dead-screen').hidden = false; $('toast').hidden = true;
+  document.body.classList.remove('presence-near');
+  if (document.pointerLockElement) document.exitPointerLock();
+  audio.tone(65, 1.6, .09, 0, 'sine', 32); audio.setActive(false);
+  $('retry-button').focus();
+}
+
+function callEntity() {
+  if (mode !== 'playing' || !advanced || !entityCall.call(player)) return;
+  dragging = false;
+  audio.callEntity();
+  // A shout gives away a hiding place even when the distant entity ignores it.
+  hiddenInShelter = false;
+  levelState.hidden = false;
+  levelState.noise = 1;
+  canvas.focus({ preventScroll: true });
+  updateHud();
+}
+
+function tickLevelOne(dt, moving, sprinting) {
+  const previousLure = entityCall.target;
+  entityCall.update(dt);
+  if (entityCall.target !== previousLure) entityRouteTick = 0;
+  const distance = Math.hypot(player.x - entityPosition.x, player.z - entityPosition.z);
+  hiddenInShelter = !moving && !flashlightOn && WORLD.shelters.some((s) => Math.hypot(player.x - s.x, player.z - s.z) < s.radius);
+  const sight = lineOfSight(player, entityPosition);
+  levelState.update(dt, { moving, sprinting: sprinting && moving, flashlightOn, hidden: hiddenInShelter, calling: entityCall.shouting, distance, lineOfSight: sight });
+  hiddenInShelter = levelState.hidden;
+  if (levelState.blackout !== lastBlackout) {
+    if (levelState.blackout) audio.tone(42, 1.8, .045);
+    lastBlackout = levelState.blackout;
   }
+  const nearby = levelState.detected > .55;
+  if (nearby && !lastPresence) audio.tone(92, 1.1, .035, 0, 'sine', 71);
+  lastPresence = nearby;
+  document.body.classList.toggle('presence-near', nearby);
+  document.body.classList.toggle('power-out', levelState.blackout);
+  // The first seconds belong to the player. After that, the listener follows connected corridors.
+  if ((elapsed > 10 || entityCall.target) && !levelState.failed) {
+    const seesPlayer = sight && distance < (flashlightOn ? 25 : 13);
+    const hearsPlayer = levelState.noise > .4 && distance < 24;
+    if (!hiddenInShelter && (seesPlayer || hearsPlayer)) lastKnownPosition = { ...player };
+    const chasing = !hiddenInShelter && lastKnownPosition && (levelState.detected > .3 || hearsPlayer);
+    if (entityCall.target && Math.hypot(entityPosition.x - entityCall.target.x, entityPosition.z - entityCall.target.z) < 1.1) {
+      entityCall.finishLure(); entityRouteTick = 0;
+    }
+    const investigating = Boolean(entityCall.target);
+    entityRouteTick -= dt;
+    if (entityRouteTick <= 0) {
+      let destination = chasing ? lastKnownPosition : entityCall.target || WORLD.patrol[patrolIndex];
+      if (!chasing && !investigating && Math.hypot(entityPosition.x - destination.x, entityPosition.z - destination.z) < 1.1) {
+        patrolIndex = (patrolIndex + 1) % WORLD.patrol.length; destination = WORLD.patrol[patrolIndex];
+      }
+      entityPath = findPath(entityPosition.x, entityPosition.z, destination.x, destination.z).slice(1);
+      // A player in the same cell is still reachable; no teleporting through walls.
+      if (!entityPath.length && lineOfSight(destination, entityPosition)) entityPath = [{ x: destination.x, z: destination.z }];
+      entityRouteTick = .75;
+    }
+    const next = entityPath[0];
+    if (next) {
+      const dx = next.x - entityPosition.x, dz = next.z - entityPosition.z;
+      const length = Math.hypot(dx, dz), step = Math.min(length, dt * (chasing ? 3.85 : investigating ? 3.2 : 1.7));
+      if (length > .001) {
+        const nx = entityPosition.x + dx / length * step, nz = entityPosition.z + dz / length * step;
+        if (isWalkable(nx, nz, .2)) {
+          entityPosition.x = nx; entityPosition.z = nz; entityStepDistance += step;
+          if (entityStepDistance > 1.2) {
+            entityStepDistance %= 1.2;
+            audio.presence(distance, (Math.cos(yaw) * (nx - player.x) - Math.sin(yaw) * (nz - player.z)) / Math.max(distance, 1), false, !sight);
+          }
+        }
+      }
+      if (length < .15) entityPath.shift();
+    }
+  }
+  breathingClock -= dt;
+  if (breathingClock <= 0 && distance < 17) {
+    audio.presence(distance, (Math.cos(yaw) * (entityPosition.x - player.x) - Math.sin(yaw) * (entityPosition.z - player.z)) / Math.max(distance, 1), true, !sight);
+    breathingClock = 3.6;
+  }
+  if (levelState.failed) failLevelOne();
 }
 
 function formatTime(seconds) {
@@ -304,60 +393,126 @@ function updateHud() {
   $('sector').textContent = sector.name;
   currentTarget = getTarget();
   $('interaction-prompt').hidden = !currentTarget || mode !== 'playing';
-  if (currentTarget) $('interaction-prompt').lastElementChild.textContent = currentTarget.kind === 'fuse'
-    ? `Recoger fusible ${currentTarget.id}` : collected.size === 3 ? 'Abrir la salida' : `Salida sin energía · ${collected.size}/3 fusibles`;
-}
-
-function updateHint(now, dt) {
-  const active = now < hintUntil && mode === 'playing';
-  $('hint-text').hidden = !active;
-  if (!active) { routeDots.forEach((dot) => { dot.visible = false; }); return; }
-  hintRefresh -= dt;
-  if (hintRefresh <= 0) {
-    const targets = collected.size === 3 ? [{ ...WORLD.exit, label: 'SALIDA' }] : WORLD.fuses.filter((f) => !collected.has(f.id));
-    const paths = targets.map((target) => ({ target, path: findPath(player.x, player.z, target.x, target.z) })).filter((p) => p.path.length);
-    paths.sort((a, b) => a.path.length - b.path.length);
-    if (paths[0]) { hintRoute = paths[0].path; hintTarget = paths[0].target; }
-    hintRefresh = .6;
+  if (currentTarget) $('interaction-prompt').lastElementChild.textContent = advanced ? 'Abrir el ascensor' : 'Abrir la salida';
+  $('flashlight-status').textContent = `LINTERNA ${flashlightOn ? 'ON' : 'OFF'}`;
+  $('touch-interact').disabled = !currentTarget || mode !== 'playing';
+  $('touch-flashlight').setAttribute('aria-pressed', String(flashlightOn));
+  $('touch-flashlight').setAttribute('aria-label', flashlightOn ? 'Apagar linterna' : 'Encender linterna');
+  $('touch-sprint').setAttribute('aria-pressed', String(touchSprint));
+  $('interaction-prompt').firstElementChild.textContent = touchMode ? 'TOCA ABRIR' : 'E';
+  if (advanced) {
+    $('shelter-status').hidden = !hiddenInShelter;
+    $('blackout-status').hidden = !levelState.blackout;
+    $('entity-call-button').disabled = entityCall.cooldown > 0;
+    $('entity-call-button').classList.toggle('is-calling', entityCall.shouting);
+    $('entity-call-status').textContent = entityCall.shouting ? 'Qué gran idea…' : entityCall.cooldown > 0 ? `Coge aire · ${Math.ceil(entityCall.cooldown)} s` : '¿Y si te escucha?';
+    $('entity-call-caption').hidden = !entityCall.shouting;
   }
-  if (!hintTarget) return;
-  // Only point ahead when the player's full collision circle can follow the segment.
-  let next = hintRoute[0];
-  for (const candidate of hintRoute.slice(1, 3)) {
-    const distance = Math.hypot(candidate.x - player.x, candidate.z - player.z);
-    let clear = true;
-    for (let step = .1; step <= distance; step += .1) {
-      if (!canMove(player.x + (candidate.x - player.x) * step / distance, player.z + (candidate.z - player.z) * step / distance)) { clear = false; break; }
-    }
-    if (clear) next = candidate; else break;
-  }
-  const targetAngle = Math.atan2(-(next.x - player.x), -(next.z - player.z));
-  const diff = Math.atan2(Math.sin(targetAngle - yaw), Math.cos(targetAngle - yaw));
-  const direction = Math.abs(diff) < .45 ? '↑ SIGUE RECTO' : Math.abs(diff) > 2.45 ? '↶ DA LA VUELTA' : diff > 0 ? '← A LA IZQUIERDA' : 'A LA DERECHA →';
-  $('hint-text').textContent = `${direction}  ·  ${hintTarget.label}  ·  ${Math.max(1, Math.round((hintRoute.length - 1) * CELL_SIZE))} m`;
-  routeDots.forEach((dot, i) => {
-    const point = hintRoute[i + 1]; dot.visible = Boolean(point);
-    if (point) dot.position.set(point.x, .025, point.z);
-  });
 }
 
 function updateLighting(time) {
-  const nearest = WORLD.lights.map((light) => ({ ...light, distance: (light.x - camera.position.x) ** 2 + (light.z - camera.position.z) ** 2 })).sort((a, b) => a.distance - b.distance);
+  if (advanced) return;
+  const nearest = WORLD.lights.filter((_, i) => i % 3 === 0).map((light) => ({ ...light, distance: (light.x - camera.position.x) ** 2 + (light.z - camera.position.z) ** 2 })).sort((a, b) => a.distance - b.distance);
   lightPool.forEach((light, i) => {
     const source = nearest[i];
     light.position.set(source.x, WALL_HEIGHT - .22, source.z);
     // A slow, low-amplitude fluctuation avoids harsh flashing.
-    light.intensity = 17 * (reducedMotion ? 1 : .98 + .02 * Math.sin(time * 3.4 + i * 8));
+    light.intensity = 4.2 * (reducedMotion ? 1 : .95 + .05 * Math.sin(time * 1.4 + i * 8));
   });
+}
+
+function configureLevelUI() {
+  document.body.dataset.level = advanced ? '1' : '0';
+  document.querySelectorAll('.level-option').forEach((link) => {
+    if (link.dataset.level === document.body.dataset.level) link.setAttribute('aria-current', 'page');
+    else link.removeAttribute('aria-current');
+  });
+  $('next-level-button').hidden = advanced;
+  $('entity-call-control').hidden = !advanced;
+  $('entity-call-instruction').hidden = !advanced;
+  $('touch-entity-call-instruction').hidden = !advanced;
+  if (!advanced) return;
+  document.title = 'BACKROOMS — Nivel 1 · El ala de servicio';
+  $('menu-eyebrow').innerHTML = '<span class="eyebrow-line"></span> ARCHIVO 002 <span class="eyebrow-separator">/</span> NIVEL 1';
+  $('menu-description').innerHTML = '<p>La salida solo llevaba más abajo.<br />Hay algo respirando en la oscuridad.</p><p class="description-last">Encuentra una puerta. Llega antes que eso.</p>';
+  $('start-button').firstElementChild.textContent = 'DESCENDER';
+  $('menu-level-name').textContent = 'NIVEL 1 — EL ALA DE SERVICIO';
+  $('menu-level-subtitle').textContent = 'RIESGO ELEVADO · PRESENCIA NO IDENTIFICADA';
+  $('instructions-intro').innerHTML = 'Encuentra el ascensor de salida y pulsa <strong>E</strong> para abrirlo. Tu linterna siempre funciona; contrólala con <strong>F</strong>. La entidad oye cuando corres y ve tu luz. Dobla una esquina y apágala para perderla. En los rincones señalizados con una luz azul tenue, quédate quieto y a oscuras para esconderte. Pulsa <strong>G</strong> para gritar «Entitiiii!!»: puede atraerla al lugar donde llamaste. Gritar te delata, incluso en un refugio.';
+  $('win-eyebrow').textContent = 'ARCHIVO 002 / TRANSMISIÓN RECUPERADA';
+  $('win-title').innerHTML = 'AL OTRO<br /><span>LADO.</span>';
+  $('win-description').innerHTML = 'Las puertas se cierran. El ascensor desciende.<br />Alguien ha pulsado el botón desde abajo.';
+  $('win-footnote').textContent = 'EN EL REGISTRO APARECEN DOS PASAJEROS.';
+}
+
+function configureInputUI() {
+  document.body.dataset.input = touchMode ? 'touch' : 'desktop';
+  document.body.dataset.mode = mode;
+  $('touch-controls').hidden = !touchMode;
+  touchControls?.setEnabled(touchMode);
+  if (!touchMode) return;
+  $('fullscreen-toggle').hidden = !document.documentElement.requestFullscreen;
+  $('instructions-intro').textContent = advanced
+    ? 'Encuentra el ascensor y toca ABRIR cuando estés cerca y mirando hacia él. La entidad ve tu luz y oye tus pasos. Dobla una esquina, apaga la linterna y quédate quieto en un refugio azul para esconderte. Entitiiii!! puede atraerla al lugar donde llamaste: gritar te delata.'
+    : 'Explora los pasillos con el joystick y busca la salida. Arrastra la zona derecha para mirar. Cuando estés cerca de la puerta y mirándola, toca ABRIR. Puedes jugar en vertical o en horizontal.';
+  $('pause-footnote').textContent = 'TOCA CONTINUAR PARA VOLVER';
+  $('dialog-note').textContent = 'Puedes moverte y mirar a la vez con dos dedos. Toca Correr para activarlo o desactivarlo. En horizontal tendrás más espacio para explorar.';
+  $('entity-call-button').title = 'Gritar Entitiiii!! · Puede atraer a la entidad';
+}
+
+function resizeViewport() {
+  resetInput();
+  camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
+  renderer.setPixelRatio(Math.min(devicePixelRatio, touchMode ? 1.25 : 1.75));
+  renderer.setSize(innerWidth, innerHeight);
+  updateHud();
+}
+
+function enableTouchMode() {
+  if (touchMode) return;
+  touchMode = true;
+  // First touch also supports hybrid devices whose media queries report a mouse.
+  if (document.pointerLockElement) document.exitPointerLock();
+  flashlight.shadow.mapSize.set(512, 512);
+  flashlight.shadow.map?.dispose(); flashlight.shadow.map = null;
+  configureInputUI(); resizeViewport();
+}
+
+function toggleFlashlight() {
+  if (mode !== 'playing') return;
+  flashlightOn = !flashlightOn; flashlight.intensity = flashlightOn ? 18 : 0;
+  updateHud();
 }
 
 function bindControls() {
   canvas.tabIndex = -1;
+  touchControls = new TouchControls({
+    joystick: $('touch-joystick'), thumb: $('touch-stick'), lookSurface: canvas,
+    isPlaying: () => mode === 'playing',
+    onLook: (dx, dy) => {
+      yaw -= dx * .004 * sensitivity;
+      pitch = THREE.MathUtils.clamp(pitch - dy * .004 * sensitivity, -1.3, 1.3);
+    },
+  });
+  touchControls.setEnabled(touchMode);
+  $('touch-pause').addEventListener('click', pauseGame);
+  $('touch-interact').addEventListener('click', interact);
+  $('touch-flashlight').addEventListener('click', toggleFlashlight);
+  $('touch-sprint').addEventListener('click', () => {
+    if (mode !== 'playing') return;
+    touchSprint = !touchSprint; updateHud();
+  });
+  document.addEventListener('pointerdown', (event) => {
+    if (event.pointerType === 'touch') enableTouchMode();
+  }, { capture: true, passive: true });
   $('start-button').addEventListener('click', () => startGame());
   $('resume-button').addEventListener('click', () => startGame(false));
   $('restart-button').addEventListener('click', () => startGame());
   $('win-restart-button').addEventListener('click', () => startGame());
   $('home-button').addEventListener('click', goHome);
+  $('retry-button').addEventListener('click', () => startGame());
+  $('dead-home-button').addEventListener('click', goHome);
+  $('entity-call-button').addEventListener('click', callEntity);
   $('instructions-button').addEventListener('click', () => $('instructions-dialog').showModal());
   $('close-instructions').addEventListener('click', () => $('instructions-dialog').close());
   $('instructions-dialog').addEventListener('click', (e) => {
@@ -385,15 +540,14 @@ function bindControls() {
       return;
     }
     if (mode !== 'playing') return;
-    if (['KeyW', 'KeyA', 'KeyS', 'KeyD', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space', 'KeyE', 'KeyF', 'KeyH'].includes(e.code)) e.preventDefault();
+    // Preserve native keyboard activation for HUD and utility buttons.
+    if (e.code === 'Space' && e.target instanceof Element && e.target.closest('button')) return;
+    if (['KeyW', 'KeyA', 'KeyS', 'KeyD', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space', 'KeyE', 'KeyF', 'KeyG'].includes(e.code)) e.preventDefault();
     keys.add(e.code);
     if (e.repeat) return;
     if (e.code === 'KeyE') interact();
-    if (e.code === 'KeyF') {
-      flashlightOn = !flashlightOn; flashlight.intensity = flashlightOn ? 24 : 0;
-      $('flashlight-status').textContent = `LINTERNA ${flashlightOn ? 'ON' : 'OFF'}`;
-    }
-    if (e.code === 'KeyH') { hintUntil = performance.now() / 1000 + 18; hintRefresh = 0; }
+    if (e.code === 'KeyG') callEntity();
+    if (e.code === 'KeyF') toggleFlashlight();
   });
   document.addEventListener('keyup', (e) => keys.delete(e.code));
   document.addEventListener('pointerlockchange', () => {
@@ -402,20 +556,19 @@ function bindControls() {
     pointerWasLocked = locked;
   });
   document.addEventListener('pointerlockerror', mouseFallback);
-  canvas.addEventListener('mousedown', (e) => { if (mode === 'playing' && e.button === 0) dragging = true; });
+  canvas.addEventListener('pointerdown', (e) => { if (e.pointerType === 'mouse' && mode === 'playing' && e.button === 0) dragging = true; });
   document.addEventListener('mouseup', () => { dragging = false; });
   canvas.addEventListener('click', () => { if (mode === 'playing' && !document.pointerLockElement) acquireMouse(); });
   document.addEventListener('mousemove', (e) => {
+    if (e.sourceCapabilities?.firesTouchEvents) return;
     if (mode !== 'playing' || (!document.pointerLockElement && !dragging)) return;
     yaw -= e.movementX * .002 * sensitivity;
     pitch = THREE.MathUtils.clamp(pitch - e.movementY * .002 * sensitivity, -1.3, 1.3);
   });
-  window.addEventListener('blur', () => { keys.clear(); if (mode === 'playing') pauseGame(); });
+  window.addEventListener('blur', () => { resetInput(); if (mode === 'playing') pauseGame(); });
   document.addEventListener('visibilitychange', () => { if (document.hidden) pauseGame(); });
-  window.addEventListener('resize', () => {
-    camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth, innerHeight);
-    renderer.setPixelRatio(Math.min(devicePixelRatio, 1.75));
-  });
+  window.addEventListener('resize', resizeViewport);
+  window.visualViewport?.addEventListener('resize', resizeViewport);
   canvas.addEventListener('webglcontextlost', (event) => {
     event.preventDefault(); pauseGame(); toast('Se perdió la conexión gráfica. Recarga la página para volver a entrar.', 60000);
   });
@@ -429,15 +582,17 @@ function frame(milliseconds) {
   let moving = false, sprinting = false;
   if (mode === 'playing') {
     elapsed += dt;
-    const forward = Number(keys.has('KeyW') || keys.has('ArrowUp')) - Number(keys.has('KeyS') || keys.has('ArrowDown'));
-    const strafe = Number(keys.has('KeyD') || keys.has('ArrowRight')) - Number(keys.has('KeyA') || keys.has('ArrowLeft'));
+    const touchMovement = touchControls.movement;
+    const forward = Number(keys.has('KeyW') || keys.has('ArrowUp')) - Number(keys.has('KeyS') || keys.has('ArrowDown')) + touchMovement.forward;
+    const strafe = Number(keys.has('KeyD') || keys.has('ArrowRight')) - Number(keys.has('KeyA') || keys.has('ArrowLeft')) + touchMovement.strafe;
     const length = Math.hypot(forward, strafe);
     if (exhausted && stamina > .3) exhausted = false;
-    sprinting = length > 0 && (keys.has('ShiftLeft') || keys.has('ShiftRight')) && !exhausted && stamina > .015;
+    sprinting = length > 0 && (keys.has('ShiftLeft') || keys.has('ShiftRight') || touchSprint) && !exhausted && stamina > .015;
     const speed = sprinting ? 6.1 : 3.45;
     if (length) {
-      const dx = (Math.cos(yaw) * strafe - Math.sin(yaw) * forward) / length * speed * dt;
-      const dz = (-Math.sin(yaw) * strafe - Math.cos(yaw) * forward) / length * speed * dt;
+      const normalization = Math.max(1, length); // Preserve the joystick's analog speed.
+      const dx = (Math.cos(yaw) * strafe - Math.sin(yaw) * forward) / normalization * speed * dt;
+      const dz = (-Math.sin(yaw) * strafe - Math.cos(yaw) * forward) / normalization * speed * dt;
       const oldX = player.x, oldZ = player.z;
       // Substeps keep collisions reliable at low frame rates and while sprinting.
       const steps = Math.max(1, Math.ceil(Math.hypot(dx, dz) / .12));
@@ -453,6 +608,7 @@ function frame(milliseconds) {
     const offset = moving && !reducedMotion ? Math.sin(bob) * (sprinting ? .042 : .025) : 0;
     camera.position.set(player.x, 1.62 + offset, player.z);
     camera.rotation.set(pitch, yaw, moving && !reducedMotion ? Math.cos(bob / 2) * .003 : 0);
+    if (advanced) tickLevelOne(dt, moving, sprinting);
     const targetFov = sprinting && moving && !reducedMotion ? 79 : 74;
     if (Math.abs(camera.fov - targetFov) > .01) { camera.fov += (targetFov - camera.fov) * Math.min(1, dt * 6); camera.updateProjectionMatrix(); }
     if (time - lastHud > .1) { updateHud(); lastHud = time; }
@@ -460,39 +616,47 @@ function frame(milliseconds) {
     camera.position.set(WORLD.spawn.x + .35, 1.63, WORLD.spawn.z - .2);
     camera.rotation.set(-.015, .34 + (reducedMotion ? 0 : Math.sin(time * .11) * .11), 0);
   }
-  audio.update({ moving: mode === 'playing' && moving, sprinting, dt, tension: collected.size / 6 });
-  updateHint(time, dt);
+  audio.update({ moving: mode === 'playing' && moving, sprinting, dt, tension: advanced ? levelState.detected : .12 });
+  if (advanced) levelScene.update(reducedMotion ? 0 : elapsed, { blackout: levelState.blackout, player: camera.position, entityPosition, threat: levelState.detected });
   if (time - lightTick > .18) { updateLighting(time); lightTick = time; }
-  fuseObjects.forEach((f, i) => {
-    if (f.item.visible) { f.item.rotation.y = time * .65; f.item.position.y = reducedMotion ? 0 : Math.sin(time * 1.9 + i) * .06; f.indicator.lookAt(camera.position.x, 2.17, camera.position.z); }
-  });
   renderer.render(scene, camera);
 }
 
 try {
-  const validation = validateWorld();
+  const validation = advanced ? validateLevelOne() : validateWorld();
   if (!validation.valid) throw new Error(validation.errors.join(' '));
-  renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: 'high-performance' });
-  renderer.setSize(innerWidth, innerHeight); renderer.setPixelRatio(Math.min(devicePixelRatio, 1.75));
+  renderer = new THREE.WebGLRenderer({ canvas, antialias: !touchMode, powerPreference: 'high-performance' });
+  renderer.setSize(innerWidth, innerHeight); renderer.setPixelRatio(Math.min(devicePixelRatio, touchMode ? 1.25 : 1.75));
   renderer.outputColorSpace = THREE.SRGBColorSpace;
-  renderer.toneMapping = THREE.ACESFilmicToneMapping; renderer.toneMappingExposure = 1.2;
-  buildWorld(); bindControls(); updateLighting(0);
+  renderer.toneMapping = THREE.ACESFilmicToneMapping; renderer.toneMappingExposure = .9;
+  renderer.shadowMap.enabled = true; renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  buildWorld(); configureLevelUI(); configureInputUI(); bindControls(); updateLighting(0);
   renderer.setAnimationLoop(frame);
   $('loading-indicator').hidden = true; $('start-button').disabled = false;
   // Development-only harness exercises the actual interaction and collision functions.
   if (import.meta.env.DEV) {
     window.__BACKROOMS__ = {
-      state: () => ({ mode, x: player.x, z: player.z, yaw, pitch, elapsed, stamina, exhausted, flashlightOn, collected: [...collected], target: currentTarget?.kind, drawCalls: renderer.info.render.calls }),
+      state: () => ({ mode, level: advanced ? 1 : 0, x: player.x, z: player.z, yaw, pitch, elapsed, stamina, exhausted, flashlightOn, target: currentTarget?.kind, drawCalls: renderer.info.render.calls,
+        inputMode: touchMode ? 'touch' : 'desktop', touch: { ...touchControls.movement, sprinting: touchSprint }, pixelRatio: renderer.getPixelRatio(),
+        ...(advanced ? { noise: levelState.noise, detected: levelState.detected, blackout: levelState.blackout, hidden: hiddenInShelter, entity: { ...entityPosition },
+          call: { count: entityCall.count, cooldown: entityCall.cooldown, shouting: entityCall.shouting, pending: Boolean(entityCall.pending), target: entityCall.target ? { ...entityCall.target } : null } } : {}) }),
       world: WORLD,
       walkTo: (x, z) => { if (!canMove(x, z)) return false; player.x = x; player.z = z; updateHud(); return true; },
       lookAt: (x, z) => { yaw = Math.atan2(-(x - player.x), -(z - player.z)); pitch = 0; updateHud(); },
       path: findPath,
       canMove,
+      advance: (seconds) => {
+        if (!advanced || !Number.isFinite(seconds) || seconds < 0 || seconds > 600) return false;
+        for (let remaining = seconds; remaining > 0 && mode === 'playing'; remaining -= .05) {
+          const dt = Math.min(.05, remaining); elapsed += dt; tickLevelOne(dt, false, false);
+        }
+        updateHud(); return true;
+      },
     };
   }
 } catch (error) {
   console.error('No se pudo iniciar Backrooms:', error);
   $('loading-indicator').hidden = true;
-  $('error-message').textContent = 'No se pudo iniciar el escenario 3D. Prueba en un navegador de escritorio con la aceleración gráfica activada.';
+  $('error-message').textContent = 'No se pudo iniciar el escenario 3D. Prueba con un navegador actualizado y compatible con WebGL 2.';
   $('error-message').hidden = false;
 }

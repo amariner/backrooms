@@ -72,17 +72,12 @@ for (let row = 2; row < SIZE - 1; row += 4) {
     if (grid[row][col] === '.') lights.push(at(col, row));
   }
 }
-// Continuous fixtures draw the eye toward the locked exit.
+// The central fixtures offer a faint landmark toward the exit.
 for (const row of [4, 8, 12, 16, 20, 24]) lights.push(at(14, row));
 
 export const WORLD = {
   grid,
   spawn: at(14, 25, { yaw: 0 }),
-  fuses: [
-    at(3, 3, { id: 'A', label: 'ARCHIVO' }),
-    at(26, 3, { id: 'B', label: 'MANTENIMIENTO' }),
-    at(26, 26, { id: 'C', label: 'OFICINAS' }),
-  ],
   exit: at(14, 2, { yaw: 0 }),
   signs: [
     at(14, 21, { yaw: 0, text: 'NIVEL 0', subtitle: 'USTED ESTÁ AQUÍ' }),
@@ -90,7 +85,7 @@ export const WORLD = {
     at(12, 10, { yaw: Math.PI / 2, text: 'ARCHIVO', subtitle: 'A · REGISTROS' }),
     at(17, 9, { yaw: -Math.PI / 2, text: 'MANTENIMIENTO →', subtitle: 'SECTOR B · ALA ESTE' }),
     at(17, 16, { yaw: -Math.PI / 2, text: 'OFICINAS →', subtitle: 'SECTOR C · PASILLO SUR' }),
-    at(14, 5, { yaw: 0, text: 'SALIDA ↑', subtitle: 'REQUIERE 3 FUSIBLES' }),
+    at(14, 5, { yaw: 0, text: 'SALIDA ↑', subtitle: 'MANTENGA EL PASO LIBRE' }),
   ],
   lights,
   sectors: [
@@ -108,19 +103,19 @@ function floorAt(layout, col, row) {
 }
 
 /** Circle versus solid tiles. Tangency is allowed; leaving the map is not. */
-export function isWalkable(x, z, radius = 0.23) {
+export function isWalkable(x, z, radius = 0.23, world = WORLD) {
   if (![x, z, radius].every(Number.isFinite) || radius < 0) return false;
   const col = Math.floor(x / CELL_SIZE);
   const row = Math.floor(z / CELL_SIZE);
-  if (!floorAt(WORLD.grid, col, row)) return false;
+  if (!floorAt(world.grid, col, row)) return false;
   if (radius === 0) return true;
   if (x - radius < 0 || z - radius < 0 ||
-      x + radius > WORLD.grid[0].length * CELL_SIZE ||
-      z + radius > WORLD.grid.length * CELL_SIZE) return false;
+      x + radius > world.grid[0].length * CELL_SIZE ||
+      z + radius > world.grid.length * CELL_SIZE) return false;
 
   for (let r = Math.floor((z - radius) / CELL_SIZE); r <= Math.floor((z + radius) / CELL_SIZE); r++) {
     for (let c = Math.floor((x - radius) / CELL_SIZE); c <= Math.floor((x + radius) / CELL_SIZE); c++) {
-      if (floorAt(WORLD.grid, c, r)) continue;
+      if (floorAt(world.grid, c, r)) continue;
       const nearestX = Math.max(c * CELL_SIZE, Math.min(x, (c + 1) * CELL_SIZE));
       const nearestZ = Math.max(r * CELL_SIZE, Math.min(z, (r + 1) * CELL_SIZE));
       if ((x - nearestX) ** 2 + (z - nearestZ) ** 2 < radius ** 2) return false;
@@ -150,15 +145,15 @@ function search(layout, startCol, startRow) {
 }
 
 /** Shortest four-direction route, including the start and destination cells. */
-export function findPath(fromX, fromZ, toX, toZ) {
+export function findPath(fromX, fromZ, toX, toZ, world = WORLD) {
   if (![fromX, fromZ, toX, toZ].every(Number.isFinite)) return [];
   const sc = Math.floor(fromX / CELL_SIZE);
   const sr = Math.floor(fromZ / CELL_SIZE);
   const tc = Math.floor(toX / CELL_SIZE);
   const tr = Math.floor(toZ / CELL_SIZE);
-  if (!floorAt(WORLD.grid, sc, sr) || !floorAt(WORLD.grid, tc, tr)) return [];
-  const width = WORLD.grid[0].length;
-  const parents = search(WORLD.grid, sc, sr);
+  if (!floorAt(world.grid, sc, sr) || !floorAt(world.grid, tc, tr)) return [];
+  const width = world.grid[0].length;
+  const parents = search(world.grid, sc, sr);
   let key = tr * width + tc;
   if (!parents.has(key)) return [];
   const path = [];
@@ -194,16 +189,9 @@ export function validateWorld(world = WORLD) {
     : new Map();
   const walkableCells = layout.reduce((total, row) => total + [...row].filter((cell) => cell === '.').length, 0);
   if (walkableCells !== reachable.size) errors.push('Todas las zonas transitables deben estar conectadas.');
-  const fuses = Array.isArray(world.fuses) ? world.fuses : [];
-  if (fuses.length !== 3 || new Set(fuses.map((fuse) => fuse?.id)).size !== 3 ||
-      fuses.some((fuse) => !['A', 'B', 'C'].includes(fuse?.id))) {
-    errors.push('Se requieren tres fusibles únicos: A, B y C.');
-  }
-  for (const [name, point] of [['Salida', world.exit], ...fuses.map((fuse) => [`Fusible ${fuse?.id ?? '?'}`, fuse])]) {
-    if (!openPosition(point)) errors.push(`${name}: posición no transitable.`);
-    else if (!reachable.has(Math.floor(point.z / CELL_SIZE) * width + Math.floor(point.x / CELL_SIZE))) {
-      errors.push(`${name}: no se puede alcanzar desde la aparición.`);
-    }
+  if (!openPosition(world.exit)) errors.push('Salida: posición no transitable.');
+  else if (!reachable.has(Math.floor(world.exit.z / CELL_SIZE) * width + Math.floor(world.exit.x / CELL_SIZE))) {
+    errors.push('Salida: no se puede alcanzar desde la aparición.');
   }
   if (!Number.isFinite(world.exit?.yaw)) errors.push('La orientación de salida debe ser válida.');
   for (const [kind, points] of [['Luz', world.lights], ['Señal', world.signs], ['Sector', world.sectors]]) {

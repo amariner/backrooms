@@ -4,12 +4,12 @@ import { CELL_SIZE, WORLD, findPath, isWalkable, validateWorld } from '../src/wo
 
 const center = (col, row) => ({ x: (col + 0.5) * CELL_SIZE, z: (row + 0.5) * CELL_SIZE });
 
-test('the whole map and all three fuses belong to one accessible building', () => {
+test('the whole map is connected and has no collection objectives', () => {
   const result = validateWorld();
   assert.equal(result.valid, true, result.errors.join('\n'));
   assert.ok(result.walkableCells > 350, 'the building provides meaningful exploration space');
   assert.equal(result.reachableCells, result.walkableCells);
-  assert.deepEqual(WORLD.fuses.map((fuse) => fuse.id), ['A', 'B', 'C']);
+  assert.equal('fuses' in WORLD, false);
 });
 
 test('the rectangular outer boundary is entirely solid', () => {
@@ -26,8 +26,8 @@ test('the rectangular outer boundary is entirely solid', () => {
   assert.equal(isWalkable(8, WORLD.grid.length * CELL_SIZE + 1), false);
 });
 
-test('each target has a valid contiguous route from the spawn', () => {
-  for (const target of [...WORLD.fuses, WORLD.exit]) {
+test('the exit is directly reachable from spawn with player clearance', () => {
+  for (const target of [WORLD.exit]) {
     const path = findPath(WORLD.spawn.x, WORLD.spawn.z, target.x, target.z);
     assert.ok(path.length > 1, `${target.id ?? 'exit'} is reachable`);
     assert.deepEqual(path[0], { x: WORLD.spawn.x, z: WORLD.spawn.z });
@@ -79,16 +79,16 @@ test('circular collision allows clearance around pillar corners', () => {
 
 test('validation diagnoses broken boundaries, inaccessible goals and malformed maps', () => {
   assert.equal(validateWorld({ ...WORLD, grid: ['##', '#'] }).valid, false);
-  assert.equal(validateWorld({ ...WORLD, fuses: [null, null, null] }).valid, false);
+  assert.equal(validateWorld({ ...WORLD, exit: null }).valid, false);
   const opened = [...WORLD.grid];
   opened[0] = `${opened[0].slice(0, 14)}.${opened[0].slice(15)}`;
   assert.ok(validateWorld({ ...WORLD, grid: opened }).errors.some((error) => error.includes('perímetro')));
   const sealed = WORLD.grid.map((row) => [...row]);
-  const target = WORLD.fuses[0];
+  const target = WORLD.exit;
   const col = Math.floor(target.x / CELL_SIZE);
   const row = Math.floor(target.z / CELL_SIZE);
   for (const [dx, dz] of [[0, 1], [0, -1], [1, 0], [-1, 0]]) sealed[row + dz][col + dx] = '#';
   const result = validateWorld({ ...WORLD, grid: sealed.map((line) => line.join('')) });
-  assert.ok(result.errors.some((error) => error.includes('Fusible A: no se puede alcanzar')));
+  assert.ok(result.errors.some((error) => error.includes('Salida: no se puede alcanzar')));
   assert.ok(result.errors.some((error) => error.includes('conectadas')));
 });
